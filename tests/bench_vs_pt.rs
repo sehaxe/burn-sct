@@ -1,11 +1,18 @@
 #![allow(missing_docs)]
+#[cfg(feature = "cuda")]
 use std::io::Read;
+#[cfg(feature = "cuda")]
 use std::time::Instant;
+#[cfg(feature = "cuda")]
 use burn::module::Param;
+#[cfg(feature = "cuda")]
 use burn::tensor::{Tensor, TensorData};
+#[cfg(feature = "cuda")]
 use burn_cuda::Cuda;
+#[cfg(feature = "cuda")]
 use burn_sct::SctLinear;
 
+#[cfg(feature = "cuda")]
 type B = Cuda;
 
 fn read_arr(r: &mut impl Read) -> (Vec<usize>, Vec<f32>) {
@@ -26,6 +33,7 @@ fn read_arr(r: &mut impl Read) -> (Vec<usize>, Vec<f32>) {
     (shape, floats)
 }
 
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore]
 fn bench_vs_pt() {
