@@ -1,3 +1,6 @@
+#![allow(missing_docs)]
+
+#[cfg(feature = "binary-tests")]
 #[cfg(test)]
 mod cmp_tests {
     use std::io::Read;
