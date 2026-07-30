@@ -1,0 +1,26 @@
+[package]
+name = "burn-sct"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Spectral Compact Training — permanent truncated SVD with Stiefel QR retraction for Burn"
+keywords = ["burn", "sct", "spectral", "svd", "low-rank"]
+repository = "https://github.com/sehaxe/burn-sct"
+homepage = "https://github.com/sehaxe/burn-sct"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["burn/std", "burn-tensor/std"]
+serde = ["dep:serde"]
+autodiff = ["burn/autodiff"]
+
+[dependencies]
+burn = { version = "0.21", default-features = false }
+burn-nn = "0.21"
+burn-tensor = "0.21"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+burn-ndarray = { version = "0.21", features = ["blas-openblas"] }
+burn = { version = "0.21", features = ["ndarray"] }
