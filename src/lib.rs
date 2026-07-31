@@ -13,7 +13,11 @@ pub struct SctConfig {
 
 impl SctConfig {
     pub fn new(in_features: usize, out_features: usize, rank: usize) -> Self {
-        Self { in_features, out_features, rank }
+        Self {
+            in_features,
+            out_features,
+            rank,
+        }
     }
     pub fn init<B: Backend>(&self, device: &B::Device) -> SctLinear<B> {
         SctLinear::new(self, device)
@@ -25,9 +29,12 @@ pub struct SctLinear<B: Backend> {
     pub u: Param<Tensor<B, 2>>,
     pub s: Param<Tensor<B, 1>>,
     pub v: Param<Tensor<B, 2>>,
-    #[module(skip)] pub rank: usize,
-    #[module(skip)] pub in_features: usize,
-    #[module(skip)] pub out_features: usize,
+    #[module(skip)]
+    pub rank: usize,
+    #[module(skip)]
+    pub in_features: usize,
+    #[module(skip)]
+    pub out_features: usize,
 }
 
 impl<B: Backend> SctLinear<B> {
@@ -37,13 +44,17 @@ impl<B: Backend> SctLinear<B> {
             u: Param::from_tensor(random_orthonormal(cfg.in_features, k, device)),
             s: Param::from_tensor(Tensor::ones([k], device)),
             v: Param::from_tensor(random_orthonormal(cfg.out_features, k, device)),
-            rank: k, in_features: cfg.in_features, out_features: cfg.out_features,
+            rank: k,
+            in_features: cfg.in_features,
+            out_features: cfg.out_features,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
         let s_b = self.s.val().clone().unsqueeze_dims(&[0]);
-        x.matmul(self.u.val().clone()).mul(s_b).matmul(self.v.val().clone().transpose())
+        x.matmul(self.u.val().clone())
+            .mul(s_b)
+            .matmul(self.v.val().clone().transpose())
     }
 
     pub fn retract(&mut self) {
@@ -55,12 +66,19 @@ impl<B: Backend> SctLinear<B> {
         let k = self.rank;
         let device = self.u.device();
         let mut eye = vec![0.0f32; k * k];
-        for i in 0..k { eye[i * k + i] = 1.0; }
+        for i in 0..k {
+            eye[i * k + i] = 1.0;
+        }
         let eye_t = Tensor::<B, 2>::from_data(TensorData::new(eye, [k, k]), &device);
         let err = |m: &Tensor<B, 2>| -> f32 {
             let diff = m.clone().transpose().matmul(m.clone()) - eye_t.clone();
-            diff.powf_scalar(2.0).into_data().bytes.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).sum::<f32>().sqrt()
+            diff.powf_scalar(2.0)
+                .into_data()
+                .bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .sum::<f32>()
+                .sqrt()
         };
         err(&self.u.val()).max(err(&self.v.val()))
     }
@@ -69,27 +87,60 @@ impl<B: Backend> SctLinear<B> {
         Self::from_dense_with_iters(dense_weight, rank, 5)
     }
 
-    pub fn from_dense_with_iters(dense_weight: Tensor<B, 2>, rank: usize, svd_iters: usize) -> Self {
+    pub fn from_dense_with_iters(
+        dense_weight: Tensor<B, 2>,
+        rank: usize,
+        svd_iters: usize,
+    ) -> Self {
         let [n, m] = dense_weight.dims();
         let k = rank.min(m).min(n);
         let device = dense_weight.device();
         let data = dense_weight.into_data();
-        let vals: Vec<f32> = data.bytes.chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let vals: Vec<f32> = data
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
         let (u_svd, s_svd, vt_svd) = svd_cpu(&vals, n, m, k, svd_iters);
-        let u_flat: Vec<f32> = vt_svd.iter().flat_map(|r| r.iter()).copied().collect();
-        let v_flat: Vec<f32> = u_svd.iter().flat_map(|r| r.iter()).copied().collect();
+        // u_svd is k rows of length n (left singular vectors = V of A^T);
+        // vt_svd is k rows of length m (right singular vectors = U of A^T).
+        // forward needs u [in=m, k] = vt_svd^T and v [out=n, k] = u_svd^T, so
+        // fill the flat arrays in [m|n][k] row-major order directly.
+        let mut u_flat = vec![0.0f32; m * k];
+        for i in 0..k {
+            for j in 0..m {
+                u_flat[j * k + i] = vt_svd[i][j];
+            }
+        }
+        let mut v_flat = vec![0.0f32; n * k];
+        for i in 0..k {
+            for r in 0..n {
+                v_flat[r * k + i] = u_svd[i][r];
+            }
+        }
         Self {
-            u: Param::from_tensor(Tensor::<B, 1>::from_floats(u_flat.as_slice(), &device).reshape([m, k])),
+            u: Param::from_tensor(
+                Tensor::<B, 1>::from_floats(u_flat.as_slice(), &device).reshape([m, k]),
+            ),
             s: Param::from_tensor(Tensor::<B, 1>::from_floats(s_svd.as_slice(), &device)),
-            v: Param::from_tensor(Tensor::<B, 1>::from_floats(v_flat.as_slice(), &device).reshape([n, k])),
-            rank: k, in_features: m, out_features: n,
+            v: Param::from_tensor(
+                Tensor::<B, 1>::from_floats(v_flat.as_slice(), &device).reshape([n, k]),
+            ),
+            rank: k,
+            in_features: m,
+            out_features: n,
         }
     }
 
-    pub fn param_count(&self) -> usize { self.rank * (self.in_features + self.out_features + 1) }
-    pub fn dense_params(&self) -> usize { self.in_features * self.out_features }
-    pub fn compression_ratio(&self) -> f64 { self.dense_params() as f64 / self.param_count() as f64 }
+    pub fn param_count(&self) -> usize {
+        self.rank * (self.in_features + self.out_features + 1)
+    }
+    pub fn dense_params(&self) -> usize {
+        self.in_features * self.out_features
+    }
+    pub fn compression_ratio(&self) -> f64 {
+        self.dense_params() as f64 / self.param_count() as f64
+    }
 }
 
 #[macro_export]
@@ -99,7 +150,9 @@ macro_rules! retract_all {
 
 fn random_orthonormal<B: Backend>(rows: usize, cols: usize, device: &B::Device) -> Tensor<B, 2> {
     orthogonalize(Tensor::<B, 2>::random(
-        [rows, cols], Distribution::Normal(0.0, 1.0 / (rows as f64).sqrt()), device,
+        [rows, cols],
+        Distribution::Normal(0.0, 1.0 / (rows as f64).sqrt()),
+        device,
     ))
 }
 
@@ -117,35 +170,104 @@ fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
         let norm = col.clone().powf_scalar(2.0).sum_dim(0).sqrt();
         let nf = f32::from_le_bytes(norm.clone().into_data().bytes[..4].try_into().unwrap());
         r_diag[i] = nf;
-        col = if nf > 1e-8 { col.div(norm) } else {
+        col = if nf > 1e-8 {
+            col.div(norm)
+        } else {
             Tensor::<B, 2>::random([m, 1], Distribution::Normal(0.0, 1.0), &device)
         };
         q_cols.push(col);
     }
     let q = Tensor::cat(q_cols, 1);
-    let signs: Vec<f32> = r_diag.iter().map(|&d| if d >= 0.0 { 1.0 } else { -1.0 }).collect();
+    let signs: Vec<f32> = r_diag
+        .iter()
+        .map(|&d| if d >= 0.0 { 1.0 } else { -1.0 })
+        .collect();
     let sign_t = Tensor::<B, 1>::from_floats(signs.as_slice(), &device).unsqueeze_dims(&[0]);
     q.mul(sign_t)
 }
 
-fn svd_cpu(data: &[f32], n: usize, m: usize, k: usize, iters: usize) -> (Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>) {
-    let frob_sq: f32 = data.iter().map(|x| x * x).sum();
-    let avg = (frob_sq / (n.min(m) as f32)).sqrt();
-    let mut s_vals = vec![avg; k];
-    let mut u = vec![vec![0.0f32; n]; k];
-    let mut vt = vec![vec![0.0f32; m]; k];
-    for i in 0..k { u[i][i % n] = 1.0; vt[i][i % m] = 1.0; }
-    for _iter in 0..iters {
-        for i in 0..k {
-            let inv_s = 1.0 / s_vals[i].max(1e-8);
-            for j in 0..m { let mut s = 0.0; for r in 0..n { s += u[i][r] * data[r * m + j]; } vt[i][j] = s * inv_s; }
-            for j in 0..n { let mut s = 0.0; for c in 0..m { s += data[j * m + c] * vt[i][c]; } u[i][j] = s * inv_s; }
-            s_vals[i] = (0..n).map(|j| u[i][j] * u[i][j]).sum::<f32>().sqrt();
-            let inv_n = 1.0 / s_vals[i].max(1e-8);
-            for j in 0..n { u[i][j] *= inv_n; } for j in 0..m { vt[i][j] *= inv_n; }
+/// Orthonormalize k vectors of dimension d (modified Gram-Schmidt).
+fn orthonormalize(vectors: &[Vec<f32>], d: usize, k: usize) -> Vec<Vec<f32>> {
+    let mut out = vec![vec![0.0f32; d]; k];
+    for i in 0..k {
+        let mut v = vectors[i].clone();
+        for j in 0..i {
+            let dot = v.iter().zip(&out[j]).map(|(a, b)| a * b).sum::<f32>();
+            for r in 0..d {
+                v[r] -= dot * out[j][r];
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        for r in 0..d {
+            out[i][r] = v[r] / norm;
         }
     }
-    (u, s_vals, vt)
+    out
+}
+
+/// Top-k SVD of an `n x m` row-major matrix via orthogonal iteration.
+///
+/// Returns `(u, s, vt)` with `A ~ u^T diag(s) vt` (u/vt are k orthonormal rows
+/// of length n/m). Orthogonal iteration keeps the k vectors distinct, unlike
+/// plain power iteration which collapses onto the dominant direction.
+fn svd_cpu(
+    data: &[f32],
+    n: usize,
+    m: usize,
+    k: usize,
+    iters: usize,
+) -> (Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>) {
+    let mut v = vec![vec![0.0f32; m]; k];
+    for i in 0..k {
+        v[i][i % m] = 1.0;
+    }
+    for _ in 0..iters {
+        // W = A V  (n x k)
+        let mut w = vec![vec![0.0f32; n]; k];
+        for i in 0..k {
+            for r in 0..n {
+                let mut acc = 0.0;
+                for j in 0..m {
+                    acc += data[r * m + j] * v[i][j];
+                }
+                w[i][r] = acc;
+            }
+        }
+        // U = orthonormal basis of A's column space
+        let u = orthonormalize(&w, n, k);
+        // Z = A^T U  (m x k)
+        let mut z = vec![vec![0.0f32; m]; k];
+        for i in 0..k {
+            for j in 0..m {
+                let mut acc = 0.0;
+                for r in 0..n {
+                    acc += data[r * m + j] * u[i][r];
+                }
+                z[i][j] = acc;
+            }
+        }
+        v = orthonormalize(&z, m, k);
+    }
+    // singular values sigma_i = ||A v_i||; u_i = A v_i / sigma_i
+    let mut u = vec![vec![0.0f32; n]; k];
+    let mut s = vec![0.0f32; k];
+    for i in 0..k {
+        let mut acc = 0.0;
+        for r in 0..n {
+            let mut a_v = 0.0;
+            for j in 0..m {
+                a_v += data[r * m + j] * v[i][j];
+            }
+            u[i][r] = a_v;
+            acc += a_v * a_v;
+        }
+        let sigma = acc.sqrt().max(1e-12);
+        for r in 0..n {
+            u[i][r] /= sigma;
+        }
+        s[i] = sigma;
+    }
+    (u, s, v)
 }
 
 #[cfg(test)]
@@ -153,48 +275,217 @@ mod tests {
     use super::*;
     use burn_ndarray::{NdArray, NdArrayDevice};
     type B = NdArray;
-    fn dev() -> NdArrayDevice { NdArrayDevice::default() }
+    fn dev() -> NdArrayDevice {
+        NdArrayDevice::default()
+    }
 
-    #[test] fn forward_shape() {
-        let l = SctLinear::<B>::new(&SctConfig::new(32,64,8),&dev());
-        assert_eq!(l.forward(Tensor::<B,2>::random([16,32],Distribution::Normal(0.0,1.0),&dev())).dims(),[16,64]);
+    #[test]
+    fn forward_shape() {
+        let l = SctLinear::<B>::new(&SctConfig::new(32, 64, 8), &dev());
+        assert_eq!(
+            l.forward(Tensor::<B, 2>::random(
+                [16, 32],
+                Distribution::Normal(0.0, 1.0),
+                &dev()
+            ))
+            .dims(),
+            [16, 64]
+        );
     }
-    #[test] fn orthonormal_init() {
-        let u = random_orthonormal::<B>(64,16,&dev());
-        let vals: Vec<f32> = u.clone().transpose().matmul(u).into_data().bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        for i in 0..16 { assert!((vals[i*16+i]-1.0).abs()<0.1); }
+    #[test]
+    fn orthonormal_init() {
+        let u = random_orthonormal::<B>(64, 16, &dev());
+        let vals: Vec<f32> = u
+            .clone()
+            .transpose()
+            .matmul(u)
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for i in 0..16 {
+            assert!((vals[i * 16 + i] - 1.0).abs() < 0.1);
+        }
     }
-    #[test] fn retract_restores_ortho() {
-        let mut l = SctLinear::<B>::new(&SctConfig::new(32,64,8),&dev());
-        l.u = Param::from_tensor(l.u.val().clone()+Tensor::<B,2>::random([32,8],Distribution::Normal(0.0,0.3),&dev()));
+    #[test]
+    fn retract_restores_ortho() {
+        let mut l = SctLinear::<B>::new(&SctConfig::new(32, 64, 8), &dev());
+        l.u = Param::from_tensor(
+            l.u.val().clone()
+                + Tensor::<B, 2>::random([32, 8], Distribution::Normal(0.0, 0.3), &dev()),
+        );
         l.retract();
-        let vals: Vec<f32> = l.u.val().clone().transpose().matmul(l.u.val().clone()).into_data().bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        for i in 0..8 { assert!((vals[i*8+i]-1.0).abs()<0.1); }
+        let vals: Vec<f32> =
+            l.u.val()
+                .clone()
+                .transpose()
+                .matmul(l.u.val().clone())
+                .into_data()
+                .bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+        for i in 0..8 {
+            assert!((vals[i * 8 + i] - 1.0).abs() < 0.1);
+        }
     }
-    #[test] fn ortho_error_decreases() {
-        let mut l = SctLinear::<B>::new(&SctConfig::new(32,64,8),&dev());
-        l.u = Param::from_tensor(l.u.val().clone()+Tensor::<B,2>::random([32,8],Distribution::Normal(0.0,0.05),&dev()));
-        let e1 = l.ortho_error(); l.retract();
+    #[test]
+    fn ortho_error_decreases() {
+        let mut l = SctLinear::<B>::new(&SctConfig::new(32, 64, 8), &dev());
+        l.u = Param::from_tensor(
+            l.u.val().clone()
+                + Tensor::<B, 2>::random([32, 8], Distribution::Normal(0.0, 0.05), &dev()),
+        );
+        let e1 = l.ortho_error();
+        l.retract();
         assert!(l.ortho_error() < e1);
     }
-    #[test] fn compression_ratio() {
-        assert!(SctLinear::<B>::new(&SctConfig::new(4096,11008,128),&dev()).compression_ratio()>20.0);
+    #[test]
+    fn compression_ratio() {
+        assert!(
+            SctLinear::<B>::new(&SctConfig::new(4096, 11008, 128), &dev()).compression_ratio()
+                > 20.0
+        );
     }
-    #[test] fn param_count() {
-        let l = SctLinear::<B>::new(&SctConfig::new(100,200,10),&dev());
-        assert_eq!(l.param_count(), 10*(100+200+1));
+    #[test]
+    fn param_count() {
+        let l = SctLinear::<B>::new(&SctConfig::new(100, 200, 10), &dev());
+        assert_eq!(l.param_count(), 10 * (100 + 200 + 1));
     }
-    #[test] fn rank_auto_clamped() {
-        assert_eq!(SctLinear::<B>::new(&SctConfig::new(32,64,1000),&dev()).rank, 32);
+    #[test]
+    fn rank_auto_clamped() {
+        assert_eq!(
+            SctLinear::<B>::new(&SctConfig::new(32, 64, 1000), &dev()).rank,
+            32
+        );
     }
-    #[test] fn from_dense_shape() {
-        let w = Tensor::<B,2>::random([64,32],Distribution::Normal(0.0,1.0),&dev());
-        let l = SctLinear::<B>::from_dense(w,8);
-        assert_eq!((l.in_features,l.out_features,l.rank),(32,64,8));
+    #[test]
+    fn orthonormalize_isolated() {
+        // two clearly non-orthonormal vectors
+        let vecs = vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![2.0f32, 3.0, 1.0, 5.0]];
+        let out = orthonormalize(&vecs, 4, 2);
+        for i in 0..2 {
+            for j in 0..2 {
+                let d = out[i].iter().zip(&out[j]).map(|(a, b)| a * b).sum::<f32>();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (d - want).abs() < 1e-4,
+                    "ortho[{i}][{j}] = {d}, want {want}"
+                );
+            }
+        }
     }
-    #[test] fn sign_correction() {
-        let q = orthogonalize::<B>(Tensor::<B,2>::random([64,16],Distribution::Normal(0.0,1.0),&dev()));
-        let vals: Vec<f32> = q.clone().transpose().matmul(q).into_data().bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        for i in 0..16 { assert!((vals[i*16+i]-1.0).abs()<0.1); }
+    #[test]
+    fn svd_cpu_roundtrip_small() {
+        // A = [[3,0],[0,2],[0,0]] 3x2 rank 2
+        let a = vec![3.0, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let (u, s, vt) = svd_cpu(&a, 3, 2, 2, 50);
+        assert!(
+            (s[0] - 3.0).abs() < 1e-3 && (s[1] - 2.0).abs() < 1e-3,
+            "s = {s:?}"
+        );
+        for r in 0..3 {
+            for c in 0..2 {
+                let mut acc = 0.0;
+                for i in 0..2 {
+                    acc += u[i][r] * s[i] * vt[i][c];
+                }
+                let e = (acc - a[r * 2 + c]).abs();
+                assert!(e < 1e-4, "a_hat[{r}][{c}] = {acc} vs {}", a[r * 2 + c]);
+            }
+        }
+    }
+    #[test]
+    fn svd_cpu_roundtrip_nondiag() {
+        // full-rank non-diagonal 3x2
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let (u, s, vt) = svd_cpu(&a, 3, 2, 2, 200);
+        for r in 0..3 {
+            for c in 0..2 {
+                let mut acc = 0.0;
+                for i in 0..2 {
+                    acc += u[i][r] * s[i] * vt[i][c];
+                }
+                let e = (acc - a[r * 2 + c]).abs();
+                assert!(e < 1e-3, "a_hat[{r}][{c}] = {acc} vs {}", a[r * 2 + c]);
+            }
+        }
+    }
+    #[test]
+    fn svd_cpu_roundtrip_64x32() {
+        // Deterministic rank-8 matrix (verified: sigma_9 = 0), no rand needed.
+        let n = 64usize;
+        let m = 32usize;
+        let mut a = vec![0.0f32; n * m];
+        for r in 0..n {
+            for j in 0..m {
+                let mut acc = 0.0;
+                for i in 0..8 {
+                    let p = ((i + 1) as f32 * (r + 1) as f32 * 0.7).sin();
+                    let q = ((i + 1) as f32 * (j + 1) as f32 * 0.3).cos();
+                    acc += p * q;
+                }
+                a[r * m + j] = acc;
+            }
+        }
+        let (u, s, vt) = svd_cpu(&a, n, m, 8, 100);
+        let mut max_e = 0.0f32;
+        for r in 0..n {
+            for j in 0..m {
+                let mut acc = 0.0;
+                for i in 0..8 {
+                    acc += u[i][r] * s[i] * vt[i][j];
+                }
+                max_e = max_e.max((acc - a[r * m + j]).abs());
+            }
+        }
+        assert!(max_e < 1e-2, "max reconstruction error {max_e}");
+    }
+    #[test]
+    fn from_dense_shape() {
+        let w = Tensor::<B, 2>::random([64, 32], Distribution::Normal(0.0, 1.0), &dev());
+        let l = SctLinear::<B>::from_dense(w, 8);
+        assert_eq!((l.in_features, l.out_features, l.rank), (32, 64, 8));
+    }
+    #[test]
+    fn from_dense_roundtrip() {
+        // Build an exactly rank-8 matrix so truncation error is zero; the SVD
+        // must reproduce it. from_dense takes the weight as [out, in].
+        let a = Tensor::<B, 2>::random([32, 8], Distribution::Normal(0.0, 1.0), &dev());
+        let b = Tensor::<B, 2>::random([8, 64], Distribution::Normal(0.0, 1.0), &dev());
+        let w = a.matmul(b); // [in, out] = [32, 64]
+        let w_t = w.transpose(); // [out, in], the layout from_dense expects
+        let l = SctLinear::<B>::from_dense_with_iters(w_t.clone(), 8, 50);
+        let w_hat =
+            l.v.val()
+                .clone()
+                .mul(l.s.val().clone().unsqueeze_dims(&[0]))
+                .matmul(l.u.val().clone().transpose()); // [out, in] = W^T
+        let err: f32 = (w_hat - w_t).powf_scalar(2.0).mean().into_scalar();
+        assert!(
+            err < 1e-4,
+            "from_dense must reproduce the dense weight, mse {err}"
+        );
+    }
+    #[test]
+    fn sign_correction() {
+        let q = orthogonalize::<B>(Tensor::<B, 2>::random(
+            [64, 16],
+            Distribution::Normal(0.0, 1.0),
+            &dev(),
+        ));
+        let vals: Vec<f32> = q
+            .clone()
+            .transpose()
+            .matmul(q)
+            .into_data()
+            .bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for i in 0..16 {
+            assert!((vals[i * 16 + i] - 1.0).abs() < 0.1);
+        }
     }
 }

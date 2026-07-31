@@ -1,7 +1,12 @@
-# burn-sct — Spectral Compact Training
+# burn-sct - Spectral Compact Training
+
+[![CI](https://github.com/sehaxe/burn-sct/actions/workflows/ci.yml/badge.svg)](https://github.com/sehaxe/burn-sct/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/burn-sct)](https://crates.io/crates/burn-sct)
+[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+[![Burn](https://img.shields.io/badge/Burn-0.21-orange.svg)](https://burn.dev)
 
 Drop-in `nn.Linear` replacement for [Burn](https://burn.dev). Weights stored as
-**permanent truncated SVD**: `W = U · diag(s) · V^T`. The dense matrix is never
+**permanent truncated SVD**: `W = U * diag(s) * V^T`. The dense matrix is never
 materialized. After each optimizer step, U and V are retracted to the Stiefel
 manifold via QR decomposition.
 
@@ -17,7 +22,7 @@ let device = Default::default();
 let cfg = SctConfig::new(512, 2048, 64);  // in=512, out=2048, rank=64
 let mut layer = SctLinear::<NdArray>::new(&cfg, &device);
 
-// Forward pass — three small matmuls, no dense matrix
+// Forward pass - three small matmuls, no dense matrix
 let y = layer.forward(x);  // [batch, 512] → [batch, 2048]
 
 // After optimizer.step(), maintain orthonormality

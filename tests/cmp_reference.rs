@@ -3,11 +3,11 @@
 #[cfg(feature = "binary-tests")]
 #[cfg(test)]
 mod cmp_tests {
-    use std::io::Read;
     use burn::module::Param;
     use burn::tensor::{Tensor, TensorData};
     use burn_ndarray::{NdArray, NdArrayDevice};
     use burn_sct::SctLinear;
+    use std::io::Read;
 
     type B = NdArray;
 
@@ -23,14 +23,18 @@ mod cmp_tests {
         let n: usize = shape.iter().product();
         let mut bytes = vec![0u8; n * 4];
         r.read_exact(&mut bytes).unwrap();
-        let floats: Vec<f32> = bytes.chunks_exact(4)
+        let floats: Vec<f32> = bytes
+            .chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         (shape, floats)
     }
 
     fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
     }
 
     #[test]
@@ -54,27 +58,23 @@ mod cmp_tests {
             let k = s_data.len();
             let batch = x_shape[0];
 
-            let mut layer = SctLinear::<B>::new(
-                &burn_sct::SctConfig::new(m, n, k),
-                &dev,
-            );
+            let mut layer = SctLinear::<B>::new(&burn_sct::SctConfig::new(m, n, k), &dev);
 
             // Override params with reference weights
-            let u_t = Tensor::<B, 2>::from_data(
-                TensorData::new(u_data.clone(), [m, k]), &dev);
-            let v_t = Tensor::<B, 2>::from_data(
-                TensorData::new(v_data.clone(), [n, k]), &dev);
-            let s_t = Tensor::<B, 1>::from_data(
-                TensorData::new(s_data.clone(), [k]), &dev);
+            let u_t = Tensor::<B, 2>::from_data(TensorData::new(u_data.clone(), [m, k]), &dev);
+            let v_t = Tensor::<B, 2>::from_data(TensorData::new(v_data.clone(), [n, k]), &dev);
+            let s_t = Tensor::<B, 1>::from_data(TensorData::new(s_data.clone(), [k]), &dev);
             layer.u = Param::from_tensor(u_t);
             layer.v = Param::from_tensor(v_t);
             layer.s = Param::from_tensor(s_t);
 
-            let x = Tensor::<B, 2>::from_data(
-                TensorData::new(x_data.clone(), [batch, m]), &dev);
+            let x = Tensor::<B, 2>::from_data(TensorData::new(x_data.clone(), [batch, m]), &dev);
             let y = layer.forward(x);
 
-            let y_vals: Vec<f32> = y.into_data().bytes.chunks_exact(4)
+            let y_vals: Vec<f32> = y
+                .into_data()
+                .bytes
+                .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect();
 
