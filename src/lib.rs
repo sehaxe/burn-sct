@@ -84,7 +84,7 @@ impl<B: Backend> SctLinear<B> {
     }
 
     pub fn from_dense(dense_weight: Tensor<B, 2>, rank: usize) -> Self {
-        Self::from_dense_with_iters(dense_weight, rank, 5)
+        Self::from_dense_with_iters(dense_weight, rank, 15)
     }
 
     pub fn from_dense_with_iters(
@@ -186,88 +186,92 @@ fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
     q.mul(sign_t)
 }
 
-/// Orthonormalize k vectors of dimension d (modified Gram-Schmidt).
-fn orthonormalize(vectors: &[Vec<f32>], d: usize, k: usize) -> Vec<Vec<f32>> {
-    let mut out = vec![vec![0.0f32; d]; k];
-    for i in 0..k {
-        let mut v = vectors[i].clone();
-        for j in 0..i {
-            let dot = v.iter().zip(&out[j]).map(|(a, b)| a * b).sum::<f32>();
-            for r in 0..d {
-                v[r] -= dot * out[j][r];
-            }
-        }
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        for r in 0..d {
-            out[i][r] = v[r] / norm;
-        }
-    }
-    out
-}
-
-/// Top-k SVD of an `n x m` row-major matrix via orthogonal iteration.
+/// Truncated SVD of an `n x m` row-major matrix via one-sided (Hestenes)
+/// Jacobi rotations. Computes the exact SVD of `A = U diag(s) V^T` (accurate
+/// to f32 rounding), then keeps the top-k triplets sorted by descending s.
 ///
-/// Returns `(u, s, vt)` with `A ~ u^T diag(s) vt` (u/vt are k orthonormal rows
-/// of length n/m). Orthogonal iteration keeps the k vectors distinct, unlike
-/// plain power iteration which collapses onto the dominant direction.
+/// Returns `(u, s, vt)` where `u[i]`/`vt[i]` are the i-th left/right singular
+/// vectors (rows of length n/m) paired with `s[i]`.
 fn svd_cpu(
     data: &[f32],
     n: usize,
     m: usize,
     k: usize,
-    iters: usize,
+    sweeps: usize,
 ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<Vec<f32>>) {
-    let mut v = vec![vec![0.0f32; m]; k];
-    for i in 0..k {
-        v[i][i % m] = 1.0;
-    }
-    for _ in 0..iters {
-        // W = A V  (n x k)
-        let mut w = vec![vec![0.0f32; n]; k];
-        for i in 0..k {
-            for r in 0..n {
-                let mut acc = 0.0;
-                for j in 0..m {
-                    acc += data[r * m + j] * v[i][j];
-                }
-                w[i][r] = acc;
-            }
+    let mut a: Vec<Vec<f32>> = vec![vec![0.0f32; n]; m];
+    for j in 0..m {
+        for r in 0..n {
+            a[j][r] = data[r * m + j];
         }
-        // U = orthonormal basis of A's column space
-        let u = orthonormalize(&w, n, k);
-        // Z = A^T U  (m x k)
-        let mut z = vec![vec![0.0f32; m]; k];
-        for i in 0..k {
-            for j in 0..m {
-                let mut acc = 0.0;
+    }
+    // accumulated right rotations: V starts as identity, columns rotated with A
+    let mut v: Vec<Vec<f32>> = (0..m)
+        .map(|j| {
+            let mut row = vec![0.0f32; m];
+            row[j] = 1.0;
+            row
+        })
+        .collect();
+
+    for _ in 0..sweeps {
+        let mut converged = true;
+        for p in 0..m {
+            for q in (p + 1)..m {
+                let mut alpha = 0.0;
+                let mut beta = 0.0;
+                let mut gamma = 0.0;
                 for r in 0..n {
-                    acc += data[r * m + j] * u[i][r];
+                    alpha += a[p][r] * a[p][r];
+                    beta += a[q][r] * a[q][r];
+                    gamma += a[p][r] * a[q][r];
                 }
-                z[i][j] = acc;
+                if gamma.abs() <= 1e-12 * (alpha * beta).sqrt() {
+                    continue;
+                }
+                converged = false;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let t = gamma.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+                for r in 0..n {
+                    let ap = a[p][r];
+                    let aq = a[q][r];
+                    a[p][r] = c * ap + s * aq;
+                    a[q][r] = c * aq - s * ap;
+                }
+                for j in 0..m {
+                    let vp = v[p][j];
+                    let vq = v[q][j];
+                    v[p][j] = c * vp + s * vq;
+                    v[q][j] = c * vq - s * vp;
+                }
             }
         }
-        v = orthonormalize(&z, m, k);
-    }
-    // singular values sigma_i = ||A v_i||; u_i = A v_i / sigma_i
-    let mut u = vec![vec![0.0f32; n]; k];
-    let mut s = vec![0.0f32; k];
-    for i in 0..k {
-        let mut acc = 0.0;
-        for r in 0..n {
-            let mut a_v = 0.0;
-            for j in 0..m {
-                a_v += data[r * m + j] * v[i][j];
-            }
-            u[i][r] = a_v;
-            acc += a_v * a_v;
+        if converged {
+            break;
         }
-        let sigma = acc.sqrt().max(1e-12);
-        for r in 0..n {
-            u[i][r] /= sigma;
-        }
-        s[i] = sigma;
     }
-    (u, s, v)
+
+    let mut cols: Vec<(f32, Vec<f32>, Vec<f32>)> = (0..m)
+        .map(|j| {
+            let sigma = a[j].iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            let u_col: Vec<f32> = a[j].iter().map(|x| x / sigma).collect();
+            (sigma, u_col, v[j].clone())
+        })
+        .collect();
+    cols.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap());
+
+    let kk = k.min(cols.len());
+    let mut u = vec![vec![0.0f32; n]; kk];
+    let mut s = vec![0.0f32; kk];
+    let mut vt = vec![vec![0.0f32; m]; kk];
+    for i in 0..kk {
+        s[i] = cols[i].0;
+        u[i].copy_from_slice(&cols[i].1);
+        vt[i].copy_from_slice(&cols[i].2);
+    }
+    (u, s, vt)
 }
 
 #[cfg(test)]
@@ -359,22 +363,6 @@ mod tests {
             SctLinear::<B>::new(&SctConfig::new(32, 64, 1000), &dev()).rank,
             32
         );
-    }
-    #[test]
-    fn orthonormalize_isolated() {
-        // two clearly non-orthonormal vectors
-        let vecs = vec![vec![1.0f32, 2.0, 3.0, 4.0], vec![2.0f32, 3.0, 1.0, 5.0]];
-        let out = orthonormalize(&vecs, 4, 2);
-        for i in 0..2 {
-            for j in 0..2 {
-                let d = out[i].iter().zip(&out[j]).map(|(a, b)| a * b).sum::<f32>();
-                let want = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (d - want).abs() < 1e-4,
-                    "ortho[{i}][{j}] = {d}, want {want}"
-                );
-            }
-        }
     }
     #[test]
     fn svd_cpu_roundtrip_small() {
