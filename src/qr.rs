@@ -129,11 +129,26 @@ pub fn qr_cpu(a: &[f32], m: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
     // Column-major storage: reflectors live in the lower part of column i
     // of R; every column update is a contiguous slice, so the per-step
     // column loops can run in parallel without aliasing.
+    // Transpose copy a (row-major) -> r (column-major), in 32-row blocks:
+    // a reads are coalesced and each r write completes a full 128B cache
+    // line of the column (32 f32), so there is no write-allocate traffic.
+    // The naive column-outer order walks a with stride k (~3% cache
+    // efficiency, ~10x slower).
     let mut r = vec![0.0f32; k * m];
-    for c in 0..k {
-        for rr in 0..m {
-            r[c * m + rr] = a[rr * n + c];
+    let mut bb = 0;
+    while bb < m {
+        let r1 = (bb + 32).min(m);
+        for c in 0..k {
+            let dst = &mut r[c * m + bb..c * m + r1];
+            let mut i = 0;
+            let mut rr = bb;
+            while rr < r1 {
+                dst[i] = a[rr * n + c];
+                i += 1;
+                rr += 1;
+            }
         }
+        bb += 32;
     }
     let mut tau = vec![0.0f32; k];
     for i in 0..k {
@@ -284,10 +299,11 @@ pub fn qr_cpu(a: &[f32], m: usize, n: usize) -> (Vec<f32>, Vec<f32>) {
             }
         }
     }
-    // convert q to row-major [m, k]
+    // convert q to row-major [m, k]: coalesced writes to q_rm, strided
+    // reads from q (which sits in L2 for the ranks SCT uses)
     let mut q_rm = vec![0.0f32; m * k];
-    for c in 0..k {
-        for rr in 0..m {
+    for rr in 0..m {
+        for c in 0..k {
             q_rm[rr * k + c] = q[c * m + rr];
         }
     }
