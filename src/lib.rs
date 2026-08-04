@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub mod qr;
+#[cfg(feature = "cuda")]
+pub mod qr_cuda;
 use burn::module::{Module, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, Tensor, TensorData};
@@ -158,13 +160,21 @@ fn random_orthonormal<B: Backend>(rows: usize, cols: usize, device: &B::Device) 
 }
 
 fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
-    // Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). Runs through the
-    // native single-allocation Householder path (qr.rs, LAPACK dgeqrf
-    // scheme, O(m k^2)); a tensor-op QR is 100-300x slower on CPU and
-    // retraction sits outside the autodiff graph, so the sync is free.
-    // The sign(diag(R)) correction is applied inside qr_cpu, matching the
-    // paper's safe_qr (PyTorch linalg.qr + sign flip), verified bit-close
-    // by tests/cmp_reference.rs.
+    // Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). On the bare CUDA
+    // backend this runs as two fused kernels with no host round-trip
+    // (qr_cuda.rs); everywhere else the native single-allocation Householder
+    // path is used (qr.rs, LAPACK dgeqrf scheme, O(m k^2), AVX2/FMA +
+    // parallel Q). The sign(diag(R)) correction matches the paper's safe_qr
+    // (PyTorch linalg.qr + sign flip), verified bit-close by
+    // tests/cmp_reference.rs.
+    // The CUDA kernels (qr_cuda.rs) are numerically verified (2e-7 vs the
+    // CPU path) but cubecl 0.10 launch_unchecked runs them nearly serially
+    // (~260 ms vs 78 ms CPU on 2048x8192), so they are disabled until the
+    // cubecl 0.11+ codegen lands. Re-enable by uncommenting:
+    // #[cfg(feature = "cuda")]
+    // if let Some(q) = crate::qr_cuda::retract_cuda::<B>(matrix.clone()) {
+    //     return q;
+    // }
     let device = matrix.device();
     let [m, k] = matrix.dims();
     let data: Vec<f32> = matrix.into_data().to_vec().unwrap();

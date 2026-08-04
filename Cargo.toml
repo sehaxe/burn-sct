@@ -15,11 +15,15 @@ std = ["burn/std", "burn-tensor/std"]
 serde = ["dep:serde"]
 autodiff = ["burn/autodiff"]
 binary-tests = []
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda"]
 
 [dependencies]
 burn = { version = "0.21", default-features = false }
 burn-nn = "0.21"
 burn-tensor = "0.21"
+burn-cuda = { version = "0.21", optional = true, default-features = false }
+burn-cubecl = { version = "0.21", optional = true, default-features = false }
+cubecl = { version = "0.10", optional = true, default-features = false, features = ["std", "cuda"] }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
