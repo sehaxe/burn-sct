@@ -158,20 +158,18 @@ fn random_orthonormal<B: Backend>(rows: usize, cols: usize, device: &B::Device) 
 }
 
 fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
-    // Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). The QR is the
-    // Householder implementation adapted from burn-rs/burn (see qr.rs);
-    // the sign correction matches the paper's safe_qr (PyTorch linalg.qr
-    // + sign flip), verified bit-close by tests/cmp_reference.rs.
-    let (q, r) = crate::qr::qr::<B>(matrix, true);
-    let k = r.dims()[0];
-    let device = r.device();
-    let mut eye = vec![0.0f32; k * k];
-    for i in 0..k {
-        eye[i * k + i] = 1.0;
-    }
-    let eye_t = Tensor::<B, 2>::from_data(TensorData::new(eye, [k, k]), &device);
-    let signs = r.mul(eye_t).sum_dim(1).sign().transpose();
-    q.mul(signs)
+    // Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). Runs through the
+    // native single-allocation Householder path (qr.rs, LAPACK dgeqrf
+    // scheme, O(m k^2)); a tensor-op QR is 100-300x slower on CPU and
+    // retraction sits outside the autodiff graph, so the sync is free.
+    // The sign(diag(R)) correction is applied inside qr_cpu, matching the
+    // paper's safe_qr (PyTorch linalg.qr + sign flip), verified bit-close
+    // by tests/cmp_reference.rs.
+    let device = matrix.device();
+    let [m, k] = matrix.dims();
+    let data: Vec<f32> = matrix.into_data().to_vec().unwrap();
+    let (q, _r) = crate::qr::qr_cpu(&data, m, k);
+    Tensor::<B, 1>::from_floats(q.as_slice(), &device).reshape([m, k])
 }
 
 /// Truncated SVD of an `n x m` row-major matrix via one-sided (Hestenes)
