@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub mod qr;
 use burn::module::{Module, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, Tensor, TensorData};
@@ -157,33 +158,20 @@ fn random_orthonormal<B: Backend>(rows: usize, cols: usize, device: &B::Device) 
 }
 
 fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
-    let [m, k] = matrix.dims();
-    let device = matrix.device();
-    let mut q_cols: Vec<Tensor<B, 2>> = Vec::with_capacity(k);
-    let mut r_diag = vec![0.0f32; k];
+    // Paper Eq 5: Q,R = QR(U); U <- Q * sign(diag(R)). The QR is the
+    // Householder implementation adapted from burn-rs/burn (see qr.rs);
+    // the sign correction matches the paper's safe_qr (PyTorch linalg.qr
+    // + sign flip), verified bit-close by tests/cmp_reference.rs.
+    let (q, r) = crate::qr::qr::<B>(matrix, true);
+    let k = r.dims()[0];
+    let device = r.device();
+    let mut eye = vec![0.0f32; k * k];
     for i in 0..k {
-        let mut col = matrix.clone().slice([0..m, i..i + 1]);
-        for q_j in q_cols.iter() {
-            let dot = q_j.clone().transpose().matmul(col.clone());
-            col = col.clone() - q_j.clone().matmul(dot);
-        }
-        let norm = col.clone().powf_scalar(2.0).sum_dim(0).sqrt();
-        let nf = f32::from_le_bytes(norm.clone().into_data().bytes[..4].try_into().unwrap());
-        r_diag[i] = nf;
-        col = if nf > 1e-8 {
-            col.div(norm)
-        } else {
-            Tensor::<B, 2>::random([m, 1], Distribution::Normal(0.0, 1.0), &device)
-        };
-        q_cols.push(col);
+        eye[i * k + i] = 1.0;
     }
-    let q = Tensor::cat(q_cols, 1);
-    let signs: Vec<f32> = r_diag
-        .iter()
-        .map(|&d| if d >= 0.0 { 1.0 } else { -1.0 })
-        .collect();
-    let sign_t = Tensor::<B, 1>::from_floats(signs.as_slice(), &device).unsqueeze_dims(&[0]);
-    q.mul(sign_t)
+    let eye_t = Tensor::<B, 2>::from_data(TensorData::new(eye, [k, k]), &device);
+    let signs = r.mul(eye_t).sum_dim(1).sign().transpose();
+    q.mul(signs)
 }
 
 /// Truncated SVD of an `n x m` row-major matrix via one-sided (Hestenes)

@@ -38,6 +38,23 @@ SCT:     y = (x @ U) * s @ V^T              [three small matmuls, O(b·k·(m+n))
 
 Where `U ∈ ℝ^{m×k}`, `V ∈ ℝ^{n×k}` have orthonormal columns, `s ∈ ℝ^k`.
 
+## QR retraction
+
+`retract()` projects U/V back onto the Stiefel manifold (paper Eq 5):
+
+```
+Q, R = QR(M);  M ← Q * sign(diag(R))
+```
+
+The QR is the Householder decomposition adapted from
+[burn-rs/burn](https://github.com/burn-rs/burn) —
+`crates/burn-tensor/src/tensor/linalg/qr.rs` (main branch, by the burn-rs
+maintainers, MIT/Apache-2.0). It is reduced to O(m·k²) for SCT's tall-skinny
+factors (m ≫ k): the reflection vectors are stored in the R pass and Q is
+built back-to-front (LAPACK `orgqr` scheme), so no `m×m` intermediate is
+ever materialized. The `sign(diag(R))` correction matches the paper's
+`safe_qr` (PyTorch `torch.linalg.qr` + sign flip).
+
 ## Memory savings (Adam, rank 32)
 
 | Model | Dense MLP | SCT MLP | Compression |
