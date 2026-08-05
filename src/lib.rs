@@ -61,8 +61,10 @@ impl<B: Backend> SctLinear<B> {
     }
 
     pub fn retract(&mut self) {
-        self.u = Param::from_tensor(orthogonalize(self.u.val().clone()));
-        self.v = Param::from_tensor(orthogonalize(self.v.val().clone()));
+        // Param::map preserves the ParamId, so optimizer momentum keyed by id
+        // isn't orphaned/reset every step.
+        self.u = self.u.clone().map(|t| orthogonalize(t));
+        self.v = self.v.clone().map(|t| orthogonalize(t));
     }
 
     pub fn ortho_error(&self) -> f32 {
@@ -176,10 +178,13 @@ fn orthogonalize<B: Backend>(matrix: Tensor<B, 2>) -> Tensor<B, 2> {
     //     return q;
     // }
     let device = matrix.device();
+    let require_grad = matrix.is_require_grad();
     let [m, k] = matrix.dims();
     let data: Vec<f32> = matrix.into_data().to_vec().unwrap();
     let (q, _r) = crate::qr::qr_cpu(&data, m, k);
-    Tensor::<B, 1>::from_floats(q.as_slice(), &device).reshape([m, k])
+    Tensor::<B, 1>::from_floats(q.as_slice(), &device)
+        .reshape([m, k])
+        .set_require_grad(require_grad)
 }
 
 /// Truncated SVD of an `n x m` row-major matrix via one-sided (Hestenes)
