@@ -4,12 +4,11 @@
 #[cfg(test)]
 mod cmp_tests {
     use burn::module::Param;
-    use burn::tensor::{Tensor, TensorData};
-    use burn_ndarray::{NdArray, NdArrayDevice};
+    use burn::tensor::{Device, Tensor, TensorData};
+    
     use burn_sct::SctLinear;
     use std::io::Read;
 
-    type B = NdArray;
 
     /// Binary layout per file (see gen_reference.py):
     /// u, v, s, x, y, u_pert, v_pert, u_ret, v_ret, w_dense, w_recon
@@ -32,7 +31,7 @@ mod cmp_tests {
         (shape, floats)
     }
 
-    fn tensor2<const D: usize>(shape: &[usize], data: &[f32], dev: &NdArrayDevice) -> Tensor<B, D> {
+    fn tensor2<const D: usize>(shape: &[usize], data: &[f32], dev: &Device) -> Tensor<D> {
         let mut dims = [1usize; D];
         dims[..D].copy_from_slice(shape);
         Tensor::from_data(TensorData::new(data.to_vec(), dims), dev)
@@ -47,7 +46,7 @@ mod cmp_tests {
 
     #[test]
     fn cmp_vs_reference() {
-        let dev = NdArrayDevice::default();
+        let dev = Device::ndarray();
         let configs = ["tiny", "small", "med", "large"];
 
         for &name in configs.iter() {
@@ -72,7 +71,7 @@ mod cmp_tests {
             let k = s_data.len();
             let batch = x_shape[0];
 
-            let mut layer = SctLinear::<B>::new(&burn_sct::SctConfig::new(m, n, k), &dev);
+            let mut layer = burn_sct::SctLinear::new(&burn_sct::SctConfig::new(m, n, k), &dev);
             layer.u = Param::from_tensor(tensor2::<2>(&[m, k], &u_data, &dev));
             layer.v = Param::from_tensor(tensor2::<2>(&[n, k], &v_data, &dev));
             layer.s = Param::from_tensor(tensor2::<1>(&[k], &s_data, &dev));
@@ -91,7 +90,7 @@ mod cmp_tests {
             // --- retract ---
             layer.u = Param::from_tensor(tensor2::<2>(&[m, k], &u_pert, &dev));
             layer.v = Param::from_tensor(tensor2::<2>(&[n, k], &v_pert, &dev));
-            layer.retract();
+            layer.retract::<burn_ndarray::NdArray>();
             let u_ret_vals: Vec<f32> = layer
                 .u
                 .val()
@@ -117,7 +116,7 @@ mod cmp_tests {
             // reconstruction of the same weight (sign-invariant). The raw
             // dense W is not comparable: a truncated SVD of a full-rank
             // matrix has intrinsic truncation error.
-            let conv = SctLinear::<B>::from_dense(tensor2::<2>(&[n, m], &w_dense, &dev), k);
+            let conv = burn_sct::SctLinear::from_dense::<burn_ndarray::NdArray>(tensor2::<2>(&[n, m], &w_dense, &dev), k);
             let recon = conv
                 .v
                 .val()

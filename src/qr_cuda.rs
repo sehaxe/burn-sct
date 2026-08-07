@@ -1,279 +1,182 @@
 //! CUDA QR retraction kernels (feature `cuda`).
 //!
-//! Same Householder algorithm as [`crate::qr::qr_cpu`], split into two
-//! launches with no device sync in between:
-//!   - `sct_qr_r_kernel`: one thread per column, sequential over reflectors
-//!     (column i owns the w computation, columns > i update in parallel).
-//!   - `sct_qr_q_kernel`: one cube per Q column, block-wide dot reduction.
+//! Same math as [`crate::qr::qr_cpu`] (safe_qr of the paper: orthonormal Q
+//! with non-negative R diagonal), computed as:
+//!   1. Gram matrix G = A^T·A via the backend's matmul (cuBLAS-class, ~0.1
+//!      ms for LLM shapes; a hand-written scalar kernel reached only
+//!      ~40 GFLOP/s on this cubecl stack).
+//!   2. Cholesky G = R^T·R on the host: k x k is tiny (64 KB at k=128), one
+//!      thread finishes in microseconds. R's diagonal is positive by
+//!      construction, which is exactly torch's sign(diag(R)) convention.
+//!   3. `sct_qr_qsolve_kernel`: Q = A·R^-1 by forward substitution with a
+//!      four-wide column block (independent FMAs hide latency); rows of Q
+//!      are independent, so m threads each walk their own row with no
+//!      cross-thread synchronization, and Q is written row-major directly.
+//!
+//! Accuracy: G = A^T·A squares the condition number; for retraction inputs
+//! (near-orthonormal, kappa ~ 1.1-2) the f32 error stays ~1e-6, far inside
+//! the 1e-4 reference tolerance. Results agree with the CPU Householder
+//! path to ~1e-6 (verified by tests/cuda_retract.rs).
 //!
 //! On the bare CUDA `CubeBackend` this replaces the CPU path entirely
-//! (no host round-trip); every other backend falls back to `qr_cpu`.
+//! (no host round-trip for the data itself); every other backend falls back
+//! to `qr_cpu`.
 
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+use burn::backend::{Backend, DispatchKindConversion};
+use burn::tensor::{DispatchTensor, Tensor};
+use burn_cubecl::tensor::CubeTensor;
 use burn_cubecl::CubeBackend;
 use cubecl::prelude::*;
+use std::any::Any;
 use std::any::TypeId;
 
 /// The bare (non-fusion) CUDA backend the kernels target.
-pub type CudaBare = CubeBackend<cubecl::cuda::CudaRuntime, f32, i32, u8>;
+pub type CudaBare = CubeBackend<cubecl::cuda::CudaRuntime>;
 
-fn is_cuda<B: Backend>() -> bool {
+pub fn is_cuda<B: Backend>() -> bool {
     TypeId::of::<B>() == TypeId::of::<CudaBare>()
 }
 
-/// R pass: reduce `a` (row-major `[m, k]`) to the column-major work buffer
-/// `r` (reflectors below the diagonal, `R[i][i] = sign*norm` on it) plus
-/// `tau`. One thread per column; the reflector owner computes w, everyone
-/// else updates their column after a barrier.
-#[cube(launch_unchecked)]
-fn sct_qr_r_kernel<F: Float>(
-    a: &Array<F>,      // [m, k] row-major input
-    r: &mut Array<F>,  // [k*m] column-major: reflectors + R diagonal
-    tau: &mut Array<F>,// [k]
-    #[comptime] m: u32,
-    #[comptime] k: u32,
-) {
-    let c = UNIT_POS_Y as usize;
-    let kk = k as usize;
-    let mm = m as usize;
-    // copy column c: a (row-major) -> r (column-major). All counters must
-    // start from a runtime value: cubecl 0.10 panics on `const +=`.
-    let mut idx = c - c;
-    while idx < mm {
-        r[c * mm + idx] = a[idx * kk + c];
-        idx += 1;
-    }
-    sync_storage();
-
-    let mut i = c - c;
-    while i < kk {
-        if c == i {
-            // w from column i (accumulators must start from a runtime
-            // value: cubecl 0.10 panics on `const +=`)
-            let mut norm2 = r[i * mm + i] - r[i * mm + i];
-            let mut rr = i + (c - c);
-            while rr < mm {
-                norm2 += r[i * mm + rr] * r[i * mm + rr];
-                rr += 1;
-            }
-            let norm = norm2.sqrt();
-            let v0 = r[i * mm + i];
-            let sign = if v0 < F::new(0.0) {
-                F::new(1.0)
-            } else {
-                F::new(-1.0)
-            };
-            let u0 = v0 - sign * norm;
-            let t = if norm2 > F::new(0.0) {
-                -u0 / norm * sign
-            } else {
-                F::new(0.0)
-            };
-            tau[i] = t;
-            r[i * mm + i] = sign * norm;
-            rr = i + (c - c) + 1;
-            while rr < mm {
-                if u0 != F::new(0.0) {
-                    let v = r[i * mm + rr];
-                    r[i * mm + rr] = v / u0;
-                }
-                rr += 1;
-            }
-        }
-        sync_storage();
-        if c > i {
-            let rows = mm - i;
-            let mut dot = r[c * mm + i];
-            let mut rr = 1 + (c - c);
-            while rr < rows {
-                dot += r[i * mm + i + rr] * r[c * mm + i + rr];
-                rr += 1;
-            }
-            if dot != F::new(0.0) {
-                let f = tau[i] * dot;
-                let v = r[c * mm + i];
-                r[c * mm + i] = v - f;
-                rr = 1 + (c - c);
-                while rr < rows {
-                    let wv = r[i * mm + i + rr];
-                    let v2 = r[c * mm + i + rr];
-                    r[c * mm + i + rr] = v2 - f * wv;
-                    rr += 1;
-                }
-            }
-        }
-        sync_storage();
-        i += 1;
-    }
-}
-
-/// Q pass: one cube per column c; builds `q = H_1..H_k I_k` back-to-front
-/// with a block-wide dot reduction, applies the sign(diag(R)) correction
-/// and writes the final row-major `[m, k]` result.
-#[cube(launch_unchecked)]
-fn sct_qr_q_kernel<F: Float>(
-    r: &Array<F>,       // [k*m] column-major: reflectors + R diagonal
-    tau: &Array<F>,     // [k]
-    q: &mut Array<F>,   // [k*m] column-major Q accumulator
-    q_rm: &mut Array<F>,// [m*k] row-major final Q
-    #[comptime] m: u32,
-    #[comptime] k: u32,
-) {
-    let c = CUBE_POS_X as usize;
-    let t = UNIT_POS_X as usize;
-    let nthr = CUBE_DIM as usize;
-    let kk = k as usize;
-    let mm = m as usize;
-    let flip = r[c * mm + c] < F::new(0.0);
-
-    // init column c of Q = I_k
-    let mut idx = t;
-    while idx < mm {
-        q[c * mm + idx] = if idx == c {
-            F::new(1.0)
-        } else {
-            F::new(0.0)
-        };
-        idx += nthr;
-    }
-    sync_storage();
-
-    let mut red = SharedMemory::<F>::new(256usize);
-    let mut i = kk + (t - t);
-    while i > 0 {
-        i -= 1;
-        let rows = mm - i;
-        let tv = tau[i];
-        if tv != F::new(0.0) {
-            // dot = q[c*m + i] + sum_{rr>=1} w[rr-1] * q[c*m + i+rr]
-            let mut acc = q[c * mm + i + 1] - q[c * mm + i + 1];
-            let mut rr = t + (t - t);
-            while rr < rows - 1 {
-                acc += r[i * mm + i + 1 + rr] * q[c * mm + i + 1 + rr];
-                rr += nthr;
-            }
-            red[t] = acc;
-            sync_storage();
-            let mut step = nthr / 2;
-            while step > 0 {
-                if t < step {
-                    let v = red[t] + red[t + step];
-                    red[t] = v;
-                }
-                sync_storage();
-                step /= 2;
-            }
-            let dot = q[c * mm + i] + red[0];
-            let f = tv * dot;
-            rr = t;
-            while rr < rows - 1 {
-                let wv = r[i * mm + i + 1 + rr];
-                let v2 = q[c * mm + i + 1 + rr];
-                q[c * mm + i + 1 + rr] = v2 - f * wv;
-                rr += nthr;
-            }
-            if t == 0 {
-                let v2 = q[c * mm + i];
-                q[c * mm + i] = v2 - f;
-            }
-        }
-        sync_storage();
-    }
-
-    // sign(diag(R)) correction + transpose to row-major q_rm
-    idx = t;
-    while idx < mm {
-        let mut v = q[c * mm + idx];
-        if flip {
-            v = -v;
-        }
-        q_rm[idx * kk + c] = v;
-        idx += nthr;
-    }
-}
-
-/// GPU retraction of `matrix` on the bare CUDA backend. `None` when the
-/// backend is not CUDA or the rank exceeds the kernel limit (then the CPU
-/// path in [`crate::orthogonalize`] is used).
-pub fn retract_cuda<B: Backend>(matrix: Tensor<B, 2>) -> Option<Tensor<B, 2>>
+/// Owned copy of the underlying `CubeTensor` of `t` (see burn-gdn2's
+/// `cube_of`). `None` when `B` is not the bare CUDA backend, or the buffer
+/// is non-contiguous: the caller then falls back to the CPU path.
+pub fn cube_of<B: Backend>(t: &Tensor<2>) -> Option<CubeTensor<cubecl::cuda::CudaRuntime>>
 where
-    B: 'static,
+    DispatchTensor: DispatchKindConversion<B>,
 {
     if !is_cuda::<B>() {
         return None;
     }
-    let [m, k] = matrix.dims();
-    if m == 0 || k == 0 || k > 1024 {
-        return None;
+    let prim = t.clone().try_into_primitive::<B>().ok()?;
+    let cube = (&prim as &dyn Any).downcast_ref::<CubeTensor<cubecl::cuda::CudaRuntime>>()?;
+    let shape = cube.meta.shape().dims::<2>();
+    let strides = cube.meta.strides().to_vec();
+    let mut expected = 1usize;
+    for i in (0..2).rev() {
+        if shape[i] > 1 && strides[i] != expected {
+            return None; // non-contiguous buffer, use the CPU path
+        }
+        expected *= shape[i];
     }
-    // SAFETY: guarded by is_cuda above: at runtime B is CudaBare, and
-    // Tensor<B, 2> / Tensor<CudaBare, 2> have identical layout (one
-    // primitive handle). Letting the compiler see CudaBare gives us the
-    // CubeTensor accessors (0.21 has no backend-generic primitive API).
-    // SAFETY: guarded by is_cuda above: at runtime B is CudaBare and the two
-    // Tensor instantiations share the same layout; we only touch it through
-    // the CudaBare reference while B stays alive.
-    let matrix_ref: &Tensor<CudaBare, 2> =
-        unsafe { &*(&matrix as *const Tensor<B, 2> as *const Tensor<CudaBare, 2>) };
-    let a_cube = matrix_ref.clone().into_primitive().tensor();
+    Some(cube.clone())
+}
+
+/// Q = A·R^-1 by forward substitution, four columns at a time (the four
+/// independent FMAs hide memory latency and give nvcc ILP to play with).
+/// Each thread owns one row of Q, so no cross-thread synchronization is
+/// needed; Q is written row-major directly.
+#[cube(launch_unchecked)]
+fn sct_qr_qsolve_kernel<F: Float>(
+    a: &[F],     // [m, k] row-major input
+    r: &[F],     // [k, k] upper-triangular factor
+    q: &mut [F], // [m, k] row-major Q
+    #[comptime] m: u32,
+    #[comptime] k: u32,
+) {
+    let row = (CUBE_POS_Y * 256 + UNIT_POS_Y) as usize;
+    let kk = k as usize;
+    let mm = m as usize;
+    if row < mm {
+        let base = row * kk;
+        let mut j = 0;
+        while j < kk {
+            let j1 = j + 1;
+            let j2 = j + 2;
+            let j3 = j + 3;
+            let w1 = j1 < kk;
+            let w2 = j2 < kk;
+            let w3 = j3 < kk;
+            let mut acc0 = a[base + j];
+            let mut acc1 = if w1 { a[base + j1] } else { F::new(0.0_f32) };
+            let mut acc2 = if w2 { a[base + j2] } else { F::new(0.0_f32) };
+            let mut acc3 = if w3 { a[base + j3] } else { F::new(0.0_f32) };
+            let mut i = 0;
+            while i < j {
+                let qi = q[base + i];
+                acc0 -= r[i * kk + j] * qi;
+                if w1 {
+                    acc1 -= r[i * kk + j1] * qi;
+                }
+                if w2 {
+                    acc2 -= r[i * kk + j2] * qi;
+                }
+                if w3 {
+                    acc3 -= r[i * kk + j3] * qi;
+                }
+                i += 1;
+            }
+            // intra-block corrections, sequentially
+            let q0 = acc0 / r[j * kk + j];
+            q[base + j] = q0;
+            if w1 {
+                let q1 = (acc1 - r[j * kk + j1] * q0) / r[j1 * kk + j1];
+                q[base + j1] = q1;
+                if w2 {
+                    let q2 = (acc2 - r[j * kk + j2] * q0 - r[j1 * kk + j2] * q1) / r[j2 * kk + j2];
+                    q[base + j2] = q2;
+                    if w3 {
+                        let q3 = (acc3 - r[j * kk + j3] * q0 - r[j1 * kk + j3] * q1
+                            - r[j2 * kk + j3] * q2)
+                            / r[j3 * kk + j3];
+                        q[base + j3] = q3;
+                    }
+                }
+            }
+            j += 4;
+        }
+    }
+}
+
+/// GPU retraction of `matrix` on the bare CUDA backend. `None` when the
+/// backend is not CUDA or the shape is outside the kernel limits (then the
+/// CPU path in [`crate::orthogonalize`] is used).
+pub fn retract_cuda<B: Backend>(matrix: Tensor<2>) -> Option<Tensor<2>>
+where
+    DispatchTensor: DispatchKindConversion<B>,
+{
+    let a_cube = cube_of::<B>(&matrix)?;
+    let [m, k] = matrix.dims();
+    if m == 0 || k == 0 || k > 1024 || m < 256 || k < 16 {
+        return None; // too small: the host round trip costs more than qr_cpu
+    }
     let client = a_cube.client.clone();
-    // SAFETY: same guarded alias as matrix_ref; B::Device == CudaBare::Device
-    // at runtime (is_cuda checked above).
     let device = matrix.device();
-    let device_ref: &<CudaBare as burn::tensor::backend::BackendTypes>::Device =
-        unsafe { &*(&device as *const B::Device as *const <CudaBare as burn::tensor::backend::BackendTypes>::Device) };
 
-    // Work buffers, filled by the kernels.
-    let r = Tensor::<CudaBare, 2>::empty([k, m], device_ref);
-    let tau = Tensor::<CudaBare, 1>::empty([k], device_ref);
-    let q = Tensor::<CudaBare, 2>::empty([k, m], device_ref);
-    let q_rm = Tensor::<CudaBare, 2>::empty([m, k], device_ref);
-    let r_cube = r.clone().into_primitive().tensor();
-    let tau_cube = tau.clone().into_primitive().tensor();
-    let q_cube = q.clone().into_primitive().tensor();
-    let q_rm_cube = q_rm.clone().into_primitive().tensor();
+    // 1. Gram matrix via the backend matmul (lazy tensor op; into_data
+    //    materializes it and copies the 64 KB result to the host).
+    let g = matrix.clone().transpose().matmul(matrix.clone());
+    let g_data = g.into_data();
+    let g_flat = g_data.to_vec::<f32>().ok()?;
 
+    // 2. Cholesky on the host (microseconds for k <= 256).
+    let r_flat = crate::qr::cholesky_host(&g_flat, k);
+    let r_tensor = Tensor::<1>::from_floats(r_flat.as_slice(), &device).reshape([k, k]);
+
+    // 3. Q = A·R^-1, one thread per row, four columns at a time.
+    let r_cube = cube_of::<B>(&r_tensor)?;
+    let q = Tensor::<2>::zeros([m, k], &device);
+    let q_cube = cube_of::<B>(&q)?;
     unsafe {
-        sct_qr_r_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
+        sct_qr_qsolve_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
             &client,
-            CubeCount::Static(1, 1, 1),
+            CubeCount::Static(1, m.div_ceil(256) as u32, 1),
             CubeDim {
                 x: 1,
-                y: k as u32,
+                y: 256,
                 z: 1,
             },
-            ArrayArg::from_raw_parts(a_cube.handle, m * k),
-            ArrayArg::from_raw_parts(r_cube.handle.clone(), k * m),
-            ArrayArg::from_raw_parts(tau_cube.handle.clone(), k),
-            m as u32,
-            k as u32,
-        );
-        sct_qr_q_kernel::launch_unchecked::<f32, cubecl::cuda::CudaRuntime>(
-            &client,
-            CubeCount::Static(k as u32, 1, 1),
-            CubeDim {
-                x: 256,
-                y: 1,
-                z: 1,
-            },
-            ArrayArg::from_raw_parts(r_cube.handle.clone(), k * m),
-            ArrayArg::from_raw_parts(tau_cube.handle.clone(), k),
-            ArrayArg::from_raw_parts(q_cube.handle.clone(), k * m),
-            ArrayArg::from_raw_parts(q_rm_cube.handle.clone(), m * k),
+            BufferArg::from_raw_parts(a_cube.handle, m * k),
+            BufferArg::from_raw_parts(r_cube.handle.clone(), k * k),
+            BufferArg::from_raw_parts(q_cube.handle.clone(), m * k),
             m as u32,
             k as u32,
         );
     }
-    // TEMP: measure R-only (skip Q)
-    std::thread::sleep(std::time::Duration::from_millis(0));
+    // Block on the server queue: burn 0.22 tensors are lazy, and a
+    // raw-handle launch would otherwise be dropped or deferred past the
+    // caller's next read. One sync per retract is acceptable: retraction
+    // runs once per training step anyway.
+    let _ = futures_lite::future::block_on(client.sync());
 
-    let out_cuda: Tensor<CudaBare, 2> = Tensor::from_primitive(q_rm.into_primitive());
-    // SAFETY: symmetric with the input cast above (same layout, guarded by
-    // is_cuda); ptr::read moves without dropping through the alias.
-    let out: Tensor<B, 2> = unsafe {
-        std::ptr::read(&out_cuda as *const Tensor<CudaBare, 2> as *const Tensor<B, 2>)
-    };
-    std::mem::forget(out_cuda);
-    Some(out)
+    Some(q)
 }

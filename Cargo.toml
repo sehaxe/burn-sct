@@ -15,17 +15,18 @@ std = ["burn/std", "burn-tensor/std"]
 serde = ["dep:serde"]
 autodiff = ["burn/autodiff"]
 binary-tests = []
-cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "burn/cuda"]
+cuda = ["dep:burn-cuda", "dep:burn-cubecl", "dep:cubecl", "dep:futures-lite", "burn/cuda", "burn-tensor/cuda"]
 
 [dependencies]
-burn = { version = "0.21", default-features = false }
-burn-nn = "0.21"
-burn-tensor = "0.21"
-burn-cuda = { version = "0.21", optional = true, default-features = false }
-burn-cubecl = { version = "0.21", optional = true, default-features = false }
-cubecl = { version = "0.10", optional = true, default-features = false, features = ["std", "cuda"] }
+burn = { version = "0.22.0-pre.1", default-features = false, features = ["extension"] }
+burn-nn = { version = "0.22.0-pre.1", default-features = false }
+burn-tensor = { version = "0.22.0-pre.1", default-features = false }
+burn-cuda = { version = "0.22.0-pre.1", optional = true, default-features = false }
+burn-cubecl = { version = "0.22.0-pre.1", optional = true, default-features = false }
+cubecl = { version = "0.11.0-pre.1", optional = true, default-features = false, features = ["std"] }
+futures-lite = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
-burn-ndarray = { version = "0.21", features = ["blas-openblas"] }
-burn = { version = "0.21", features = ["ndarray"] }
+burn-ndarray = { version = "0.22.0-pre.1", features = ["blas-openblas"] }
+burn = { version = "0.22.0-pre.1", default-features = false, features = ["ndarray", "autodiff", "cuda", "extension"] }
