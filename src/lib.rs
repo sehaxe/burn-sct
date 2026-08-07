@@ -54,10 +54,15 @@ impl<B: Backend> SctLinear<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
-        let s_b = self.s.val().clone().unsqueeze_dims(&[0]);
-        x.matmul(self.u.val().clone())
-            .mul(s_b)
-            .matmul(self.v.val().clone().transpose())
+        // Fold the singular values into U (scale its columns) once per forward:
+        // x·U·diag(s)·V^T = x·(U·s)·V^T. Saves the full [B,N,k] scaling pass
+        // that used to sit between the two matmuls.
+        let us = self
+            .u
+            .val()
+            .clone()
+            .mul(self.s.val().clone().unsqueeze_dims(&[0]));
+        x.matmul(us).matmul(self.v.val().clone().transpose())
     }
 
     pub fn retract(&mut self) {
