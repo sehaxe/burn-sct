@@ -85,3 +85,11 @@ never raw singular vectors (unique only up to sign).
 ## License
 
 AGPL-3.0
+
+## Performance
+
+- **Forward** is memory-optimal: `y = (x@U)·s @ Vᵀ` — peak footprint is just
+  the input + the two GEMM outputs (no extra `[in, k]` intermediate).
+- **QR retract** runs on CUDA via custom `sct_qr_r`/`sct_qr_q` kernels (no host
+  round-trip, verified 2e-7); the CPU fallback uses AVX2/FMA SIMD dot3 on
+  x86_64.
